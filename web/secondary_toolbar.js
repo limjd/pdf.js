@@ -13,7 +13,9 @@
  * limitations under the License.
  */
 
-import { mozL10n, SCROLLBAR_PADDING } from './ui_utils';
+import { ScrollMode, SpreadMode } from './base_viewer';
+import { CursorTool } from './pdf_cursor_tools';
+import { SCROLLBAR_PADDING } from './ui_utils';
 
 /**
  * @typedef {Object} SecondaryToolbarOptions
@@ -39,7 +41,9 @@ import { mozL10n, SCROLLBAR_PADDING } from './ui_utils';
  *   clockwise.
  * @property {HTMLButtonElement} pageRotateCcwButton - Button to rotate the
  *   pages counterclockwise.
- * @property {HTMLButtonElement} toggleHandToolButton - Button to toggle the
+ * @property {HTMLButtonElement} cursorSelectToolButton - Button to enable the
+ *   select tool.
+ * @property {HTMLButtonElement} cursorHandToolButton - Button to enable the
  *   hand tool.
  * @property {HTMLButtonElement} documentPropertiesButton - Button for opening
  *   the document properties dialog.
@@ -57,21 +61,36 @@ class SecondaryToolbar {
     this.toolbarButtonContainer = options.toolbarButtonContainer;
     this.buttons = [
       { element: options.presentationModeButton, eventName: 'presentationmode',
-        close: true },
-      { element: options.openFileButton, eventName: 'openfile', close: true },
-      { element: options.printButton, eventName: 'print', close: true },
-      { element: options.downloadButton, eventName: 'download', close: true },
-      { element: options.viewBookmarkButton, eventName: null, close: true },
-      { element: options.firstPageButton, eventName: 'firstpage', close: true },
-      { element: options.lastPageButton, eventName: 'lastpage', close: true },
+        close: true, },
+      { element: options.openFileButton, eventName: 'openfile', close: true, },
+      { element: options.printButton, eventName: 'print', close: true, },
+      { element: options.downloadButton, eventName: 'download', close: true, },
+      { element: options.viewBookmarkButton, eventName: null, close: true, },
+      { element: options.firstPageButton, eventName: 'firstpage',
+        close: true, },
+      { element: options.lastPageButton, eventName: 'lastpage', close: true, },
       { element: options.pageRotateCwButton, eventName: 'rotatecw',
-        close: false },
+        close: false, },
       { element: options.pageRotateCcwButton, eventName: 'rotateccw',
-        close: false },
-      { element: options.toggleHandToolButton, eventName: 'togglehandtool',
-        close: true },
+        close: false, },
+      { element: options.cursorSelectToolButton, eventName: 'switchcursortool',
+        eventDetails: { tool: CursorTool.SELECT, }, close: true, },
+      { element: options.cursorHandToolButton, eventName: 'switchcursortool',
+        eventDetails: { tool: CursorTool.HAND, }, close: true, },
+      { element: options.scrollVerticalButton, eventName: 'switchscrollmode',
+        eventDetails: { mode: ScrollMode.VERTICAL, }, close: true, },
+      { element: options.scrollHorizontalButton, eventName: 'switchscrollmode',
+        eventDetails: { mode: ScrollMode.HORIZONTAL, }, close: true, },
+      { element: options.scrollWrappedButton, eventName: 'switchscrollmode',
+        eventDetails: { mode: ScrollMode.WRAPPED, }, close: true, },
+      { element: options.spreadNoneButton, eventName: 'switchspreadmode',
+        eventDetails: { mode: SpreadMode.NONE, }, close: true, },
+      { element: options.spreadOddButton, eventName: 'switchspreadmode',
+        eventDetails: { mode: SpreadMode.ODD, }, close: true, },
+      { element: options.spreadEvenButton, eventName: 'switchspreadmode',
+        eventDetails: { mode: SpreadMode.EVEN, }, close: true, },
       { element: options.documentPropertiesButton,
-        eventName: 'documentproperties', close: true }
+        eventName: 'documentproperties', close: true, },
     ];
     this.items = {
       firstPage: options.firstPageButton,
@@ -89,9 +108,12 @@ class SecondaryToolbar {
 
     this.reset();
 
-    // Bind the event listeners for click and hand tool actions.
+    // Bind the event listeners for click, cursor tool, and scroll/spread mode
+    // actions.
     this._bindClickListeners();
-    this._bindHandToolListener(options.toggleHandToolButton);
+    this._bindCursorToolsListener(options);
+    this._bindScrollModeListener(options);
+    this._bindSpreadModeListener(options);
 
     // Bind the event listener for adjusting the 'max-height' of the toolbar.
     this.eventBus.on('resize', this._setMaxHeight.bind(this));
@@ -133,11 +155,15 @@ class SecondaryToolbar {
 
     // All items within the secondary toolbar.
     for (let button in this.buttons) {
-      let { element, eventName, close, } = this.buttons[button];
+      let { element, eventName, close, eventDetails, } = this.buttons[button];
 
       element.addEventListener('click', (evt) => {
         if (eventName !== null) {
-          this.eventBus.dispatch(eventName, { source: this, });
+          let details = { source: this, };
+          for (let property in eventDetails) {
+            details[property] = eventDetails[property];
+          }
+          this.eventBus.dispatch(eventName, details);
         }
         if (close) {
           this.close();
@@ -146,26 +172,41 @@ class SecondaryToolbar {
     }
   }
 
-  _bindHandToolListener(toggleHandToolButton) {
-    let isHandToolActive = false;
+  _bindCursorToolsListener(buttons) {
+    this.eventBus.on('cursortoolchanged', function(evt) {
+      buttons.cursorSelectToolButton.classList.remove('toggled');
+      buttons.cursorHandToolButton.classList.remove('toggled');
 
-    this.eventBus.on('handtoolchanged', function(evt) {
-      if (isHandToolActive === evt.isActive) {
-        return;
+      switch (evt.tool) {
+        case CursorTool.SELECT:
+          buttons.cursorSelectToolButton.classList.add('toggled');
+          break;
+        case CursorTool.HAND:
+          buttons.cursorHandToolButton.classList.add('toggled');
+          break;
       }
-      isHandToolActive = evt.isActive;
+    });
+  }
 
-      if (isHandToolActive) {
-        toggleHandToolButton.title =
-          mozL10n.get('hand_tool_disable.title', null, 'Disable hand tool');
-        toggleHandToolButton.firstElementChild.textContent =
-          mozL10n.get('hand_tool_disable_label', null, 'Disable hand tool');
-      } else {
-        toggleHandToolButton.title =
-          mozL10n.get('hand_tool_enable.title', null, 'Enable hand tool');
-        toggleHandToolButton.firstElementChild.textContent =
-          mozL10n.get('hand_tool_enable_label', null, 'Enable hand tool');
-      }
+  _bindScrollModeListener(buttons) {
+    this.eventBus.on('scrollmodechanged', function(evt) {
+      buttons.scrollVerticalButton.classList.toggle('toggled',
+        evt.mode === ScrollMode.VERTICAL);
+      buttons.scrollHorizontalButton.classList.toggle('toggled',
+        evt.mode === ScrollMode.HORIZONTAL);
+      buttons.scrollWrappedButton.classList.toggle('toggled',
+        evt.mode === ScrollMode.WRAPPED);
+    });
+  }
+
+  _bindSpreadModeListener(buttons) {
+    this.eventBus.on('spreadmodechanged', function(evt) {
+      buttons.spreadNoneButton.classList.toggle('toggled',
+        evt.mode === SpreadMode.NONE);
+      buttons.spreadOddButton.classList.toggle('toggled',
+        evt.mode === SpreadMode.ODD);
+      buttons.spreadEvenButton.classList.toggle('toggled',
+        evt.mode === SpreadMode.EVEN);
     });
   }
 

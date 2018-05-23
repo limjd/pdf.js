@@ -14,6 +14,34 @@
  */
 
 import { CMapCompressionType } from '../../src/shared/util';
+import isNodeJS from '../../src/shared/is_node';
+import { isRef } from '../../src/core/primitives';
+
+class NodeFileReaderFactory {
+  static fetch(params) {
+    var fs = require('fs');
+    var file = fs.readFileSync(params.path);
+    return new Uint8Array(file);
+  }
+}
+
+const TEST_PDFS_PATH = {
+  dom: '../pdfs/',
+  node: './test/pdfs/',
+};
+
+function buildGetDocumentParams(filename, options) {
+  let params = Object.create(null);
+  if (isNodeJS()) {
+    params.url = TEST_PDFS_PATH.node + filename;
+  } else {
+    params.url = new URL(TEST_PDFS_PATH.dom + filename, window.location).href;
+  }
+  for (let option in options) {
+    params[option] = options[option];
+  }
+  return params;
+}
 
 class NodeCMapReaderFactory {
   constructor({ baseUrl = null, isCompressed = false, }) {
@@ -22,6 +50,11 @@ class NodeCMapReaderFactory {
   }
 
   fetch({ name, }) {
+    if (!this.baseUrl) {
+      return Promise.reject(new Error(
+        'The CMap "baseUrl" parameter must be specified, ensure that ' +
+        'the "cMapUrl" and "cMapPacked" API parameters are provided.'));
+    }
     if (!name) {
       return Promise.reject(new Error('CMap name must be specified.'));
     }
@@ -46,6 +79,40 @@ class NodeCMapReaderFactory {
   }
 }
 
+class XRefMock {
+  constructor(array) {
+    this._map = Object.create(null);
+
+    for (let key in array) {
+      let obj = array[key];
+      this._map[obj.ref.toString()] = obj.data;
+    }
+  }
+
+  fetch(ref) {
+    return this._map[ref.toString()];
+  }
+
+  fetchAsync(ref) {
+    return Promise.resolve(this.fetch(ref));
+  }
+
+  fetchIfRef(obj) {
+    if (!isRef(obj)) {
+      return obj;
+    }
+    return this.fetch(obj);
+  }
+
+  fetchIfRefAsync(obj) {
+    return Promise.resolve(this.fetchIfRef(obj));
+  }
+}
+
 export {
+  NodeFileReaderFactory,
   NodeCMapReaderFactory,
+  XRefMock,
+  buildGetDocumentParams,
+  TEST_PDFS_PATH,
 };

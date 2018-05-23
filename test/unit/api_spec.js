@@ -14,27 +14,41 @@
  */
 
 import {
+  buildGetDocumentParams, NodeFileReaderFactory, TEST_PDFS_PATH
+} from './test_utils';
+import {
   createPromiseCapability, FontType, InvalidPDFException, MissingPDFException,
-  PasswordException, PasswordResponses, StreamType
+  OPS, PasswordException, PasswordResponses, StreamType, stringToBytes
 } from '../../src/shared/util';
 import {
   DOMCanvasFactory, RenderingCancelledException
 } from '../../src/display/dom_utils';
-import { PDFDocumentProxy, PDFPageProxy } from '../../src/display/api';
-import { PDFJS } from '../../src/display/global';
+import {
+  getDocument, PDFDataRangeTransport, PDFDocumentProxy, PDFPageProxy, PDFWorker
+} from '../../src/display/api';
+import { GlobalWorkerOptions } from '../../src/display/worker_options';
+import isNodeJS from '../../src/shared/is_node';
 
 describe('api', function() {
-  var basicApiUrl = new URL('../pdfs/basicapi.pdf', window.location).href;
-  var basicApiFileLength = 105779; // bytes
-  var CanvasFactory;
+  let basicApiFileName = 'basicapi.pdf';
+  let basicApiFileLength = 105779; // bytes
+  let basicApiGetDocumentParams = buildGetDocumentParams(basicApiFileName);
+
+  let CanvasFactory;
 
   beforeAll(function(done) {
-    CanvasFactory = new DOMCanvasFactory();
+    if (isNodeJS()) {
+      // NOTE: To support running the canvas-related tests in Node.js,
+      // a `NodeCanvasFactory` would need to be added (in test_utils.js).
+    } else {
+      CanvasFactory = new DOMCanvasFactory();
+    }
     done();
   });
 
-  afterAll(function () {
+  afterAll(function(done) {
     CanvasFactory = null;
+    done();
   });
 
   function waitSome(callback) {
@@ -44,265 +58,272 @@ describe('api', function() {
     }, WAIT_TIMEOUT);
   }
 
-  describe('PDFJS', function() {
-    describe('getDocument', function() {
-      it('creates pdf doc from URL', function(done) {
-        var loadingTask = PDFJS.getDocument(basicApiUrl);
+  describe('getDocument', function() {
+    it('creates pdf doc from URL', function(done) {
+      var loadingTask = getDocument(basicApiGetDocumentParams);
 
-        var isProgressReportedResolved = false;
-        var progressReportedCapability = createPromiseCapability();
+      var isProgressReportedResolved = false;
+      var progressReportedCapability = createPromiseCapability();
 
-        // Attach the callback that is used to report loading progress;
-        // similarly to how viewer.js works.
-        loadingTask.onProgress = function (progressData) {
-          if (!isProgressReportedResolved) {
-            isProgressReportedResolved = true;
-            progressReportedCapability.resolve(progressData);
-          }
-        };
+      // Attach the callback that is used to report loading progress;
+      // similarly to how viewer.js works.
+      loadingTask.onProgress = function (progressData) {
+        if (!isProgressReportedResolved) {
+          isProgressReportedResolved = true;
+          progressReportedCapability.resolve(progressData);
+        }
+      };
 
-        var promises = [
-          progressReportedCapability.promise,
-          loadingTask.promise
-        ];
-        Promise.all(promises).then(function (data) {
-          expect((data[0].loaded / data[0].total) > 0).toEqual(true);
-          expect(data[1] instanceof PDFDocumentProxy).toEqual(true);
-          expect(loadingTask).toEqual(data[1].loadingTask);
-          loadingTask.destroy().then(done);
-        }).catch(function (reason) {
-          done.fail(reason);
-        });
+      var promises = [
+        progressReportedCapability.promise,
+        loadingTask.promise
+      ];
+      Promise.all(promises).then(function (data) {
+        expect((data[0].loaded / data[0].total) > 0).toEqual(true);
+        expect(data[1] instanceof PDFDocumentProxy).toEqual(true);
+        expect(loadingTask).toEqual(data[1].loadingTask);
+        loadingTask.destroy().then(done);
+      }).catch(function (reason) {
+        done.fail(reason);
       });
-      it('creates pdf doc from URL and aborts before worker initialized',
-          function(done) {
-        var loadingTask = PDFJS.getDocument(basicApiUrl);
-        let destroyed = loadingTask.destroy();
+    });
+    it('creates pdf doc from URL and aborts before worker initialized',
+        function(done) {
+      var loadingTask = getDocument(basicApiGetDocumentParams);
+      let destroyed = loadingTask.destroy();
 
-        loadingTask.promise.then(function(reason) {
-          done.fail('shall fail loading');
-        }).catch(function (reason) {
-          expect(true).toEqual(true);
-          destroyed.then(done);
-        });
+      loadingTask.promise.then(function(reason) {
+        done.fail('shall fail loading');
+      }).catch(function (reason) {
+        expect(true).toEqual(true);
+        destroyed.then(done);
       });
-      it('creates pdf doc from URL and aborts loading after worker initialized',
-          function(done) {
-        var loadingTask = PDFJS.getDocument(basicApiUrl);
-        // This can be somewhat random -- we cannot guarantee perfect
-        // 'Terminate' message to the worker before/after setting up pdfManager.
-        var destroyed = loadingTask._worker.promise.then(function () {
-          return loadingTask.destroy();
-        });
-        destroyed.then(function (data) {
-          expect(true).toEqual(true);
-          done();
-        }).catch(function (reason) {
-          done.fail(reason);
-        });
+    });
+    it('creates pdf doc from URL and aborts loading after worker initialized',
+        function(done) {
+      var loadingTask = getDocument(basicApiGetDocumentParams);
+      // This can be somewhat random -- we cannot guarantee perfect
+      // 'Terminate' message to the worker before/after setting up pdfManager.
+      var destroyed = loadingTask._worker.promise.then(function () {
+        return loadingTask.destroy();
       });
-      it('creates pdf doc from typed array', function(done) {
-        var nonBinaryRequest = PDFJS.disableWorker;
-        var request = new XMLHttpRequest();
-        request.open('GET', basicApiUrl, false);
-        if (!nonBinaryRequest) {
-          try {
-            request.responseType = 'arraybuffer';
-            nonBinaryRequest = request.responseType !== 'arraybuffer';
-          } catch (e) {
-            nonBinaryRequest = true;
-          }
+      destroyed.then(function (data) {
+        expect(true).toEqual(true);
+        done();
+      }).catch(function (reason) {
+        done.fail(reason);
+      });
+    });
+    it('creates pdf doc from typed array', function(done) {
+      var typedArrayPdf;
+      if (isNodeJS()) {
+        typedArrayPdf = NodeFileReaderFactory.fetch({
+          path: TEST_PDFS_PATH.node + basicApiFileName,
+        });
+      } else {
+        let nonBinaryRequest = false;
+        let request = new XMLHttpRequest();
+        request.open('GET', TEST_PDFS_PATH.dom + basicApiFileName, false);
+        try {
+          request.responseType = 'arraybuffer';
+          nonBinaryRequest = request.responseType !== 'arraybuffer';
+        } catch (e) {
+          nonBinaryRequest = true;
         }
         if (nonBinaryRequest && request.overrideMimeType) {
           request.overrideMimeType('text/plain; charset=x-user-defined');
         }
         request.send(null);
 
-        var typedArrayPdf;
         if (nonBinaryRequest) {
-          var data = Array.prototype.map.call(request.responseText,
-              function (ch) {
-            return ch.charCodeAt(0) & 0xFF;
-          });
-          typedArrayPdf = new Uint8Array(data);
+          typedArrayPdf = stringToBytes(request.responseText);
         } else {
           typedArrayPdf = new Uint8Array(request.response);
         }
-        // Sanity check to make sure that we fetched the entire PDF file.
-        expect(typedArrayPdf.length).toEqual(basicApiFileLength);
+      }
+      // Sanity check to make sure that we fetched the entire PDF file.
+      expect(typedArrayPdf.length).toEqual(basicApiFileLength);
 
-        var loadingTask = PDFJS.getDocument(typedArrayPdf);
-        loadingTask.promise.then(function(data) {
-          expect(data instanceof PDFDocumentProxy).toEqual(true);
-          loadingTask.destroy().then(done);
-        }).catch(function (reason) {
-          done.fail(reason);
-        });
+      var loadingTask = getDocument(typedArrayPdf);
+      loadingTask.promise.then(function(data) {
+        expect(data instanceof PDFDocumentProxy).toEqual(true);
+        loadingTask.destroy().then(done);
+      }).catch(function (reason) {
+        done.fail(reason);
       });
-      it('creates pdf doc from invalid PDF file', function(done) {
-        // A severely corrupt PDF file (even Adobe Reader fails to open it).
-        var url = new URL('../pdfs/bug1020226.pdf', window.location).href;
-
-        var loadingTask = PDFJS.getDocument(url);
-        loadingTask.promise.then(function () {
-          done.fail('shall fail loading');
-        }).catch(function (error) {
-          expect(error instanceof InvalidPDFException).toEqual(true);
-          loadingTask.destroy().then(done);
-        });
+    });
+    it('creates pdf doc from invalid PDF file', function(done) {
+      // A severely corrupt PDF file (even Adobe Reader fails to open it).
+      var loadingTask = getDocument(buildGetDocumentParams('bug1020226.pdf'));
+      loadingTask.promise.then(function () {
+        done.fail('shall fail loading');
+      }).catch(function (error) {
+        expect(error instanceof InvalidPDFException).toEqual(true);
+        loadingTask.destroy().then(done);
       });
-      it('creates pdf doc from non-existent URL', function(done) {
-        var nonExistentUrl = new URL('../pdfs/non-existent.pdf',
-                                     window.location).href;
-        var loadingTask = PDFJS.getDocument(nonExistentUrl);
-        loadingTask.promise.then(function(error) {
-          done.fail('shall fail loading');
-        }).catch(function (error) {
-          expect(error instanceof MissingPDFException).toEqual(true);
-          loadingTask.destroy().then(done);
-        });
+    });
+    it('creates pdf doc from non-existent URL', function(done) {
+      if (isNodeJS()) {
+        pending('XMLHttpRequest is not supported in Node.js.');
+      }
+      var loadingTask = getDocument(
+        buildGetDocumentParams('non-existent.pdf'));
+      loadingTask.promise.then(function(error) {
+        done.fail('shall fail loading');
+      }).catch(function (error) {
+        expect(error instanceof MissingPDFException).toEqual(true);
+        loadingTask.destroy().then(done);
       });
-      it('creates pdf doc from PDF file protected with user and owner password',
-         function (done) {
-        var url = new URL('../pdfs/pr6531_1.pdf', window.location).href;
-        var loadingTask = PDFJS.getDocument(url);
+    });
+    it('creates pdf doc from PDF file protected with user and owner password',
+        function (done) {
+      var loadingTask = getDocument(buildGetDocumentParams('pr6531_1.pdf'));
 
-        var isPasswordNeededResolved = false;
-        var passwordNeededCapability = createPromiseCapability();
-        var isPasswordIncorrectResolved = false;
-        var passwordIncorrectCapability = createPromiseCapability();
+      var isPasswordNeededResolved = false;
+      var passwordNeededCapability = createPromiseCapability();
+      var isPasswordIncorrectResolved = false;
+      var passwordIncorrectCapability = createPromiseCapability();
 
-        // Attach the callback that is used to request a password;
-        // similarly to how viewer.js handles passwords.
-        loadingTask.onPassword = function (updatePassword, reason) {
-          if (reason === PasswordResponses.NEED_PASSWORD &&
-              !isPasswordNeededResolved) {
-            isPasswordNeededResolved = true;
-            passwordNeededCapability.resolve();
+      // Attach the callback that is used to request a password;
+      // similarly to how viewer.js handles passwords.
+      loadingTask.onPassword = function (updatePassword, reason) {
+        if (reason === PasswordResponses.NEED_PASSWORD &&
+            !isPasswordNeededResolved) {
+          isPasswordNeededResolved = true;
+          passwordNeededCapability.resolve();
 
-            updatePassword('qwerty'); // Provide an incorrect password.
-            return;
-          }
-          if (reason === PasswordResponses.INCORRECT_PASSWORD &&
-              !isPasswordIncorrectResolved) {
-            isPasswordIncorrectResolved = true;
-            passwordIncorrectCapability.resolve();
+          updatePassword('qwerty'); // Provide an incorrect password.
+          return;
+        }
+        if (reason === PasswordResponses.INCORRECT_PASSWORD &&
+            !isPasswordIncorrectResolved) {
+          isPasswordIncorrectResolved = true;
+          passwordIncorrectCapability.resolve();
 
-            updatePassword('asdfasdf'); // Provide the correct password.
-            return;
-          }
-          // Shouldn't get here.
-          expect(false).toEqual(true);
-        };
+          updatePassword('asdfasdf'); // Provide the correct password.
+          return;
+        }
+        // Shouldn't get here.
+        expect(false).toEqual(true);
+      };
 
-        var promises = [
-          passwordNeededCapability.promise,
-          passwordIncorrectCapability.promise,
-          loadingTask.promise
-        ];
-        Promise.all(promises).then(function (data) {
-          expect(data[2] instanceof PDFDocumentProxy).toEqual(true);
-          loadingTask.destroy().then(done);
-        }).catch(function (reason) {
-          done.fail(reason);
-        });
+      var promises = [
+        passwordNeededCapability.promise,
+        passwordIncorrectCapability.promise,
+        loadingTask.promise
+      ];
+      Promise.all(promises).then(function (data) {
+        expect(data[2] instanceof PDFDocumentProxy).toEqual(true);
+        loadingTask.destroy().then(done);
+      }).catch(function (reason) {
+        done.fail(reason);
       });
-      it('creates pdf doc from PDF file protected with only a user password',
-         function (done) {
-        var url = new URL('../pdfs/pr6531_2.pdf', window.location).href;
+    });
+    it('creates pdf doc from PDF file protected with only a user password',
+        function (done) {
+      var filename = 'pr6531_2.pdf';
 
-        var passwordNeededLoadingTask = PDFJS.getDocument({
-          url, password: '',
-        });
-        var result1 = passwordNeededLoadingTask.promise.then(function () {
-          done.fail('shall fail with no password');
-          return Promise.reject(new Error('loadingTask should be rejected'));
-        }, function (data) {
-          expect(data instanceof PasswordException).toEqual(true);
-          expect(data.code).toEqual(PasswordResponses.NEED_PASSWORD);
-          return passwordNeededLoadingTask.destroy();
-        });
-
-        var passwordIncorrectLoadingTask = PDFJS.getDocument({
-          url, password: 'qwerty',
-        });
-        var result2 = passwordIncorrectLoadingTask.promise.then(function () {
-          done.fail('shall fail with wrong password');
-          return Promise.reject(new Error('loadingTask should be rejected'));
-        }, function (data) {
-          expect(data instanceof PasswordException).toEqual(true);
-          expect(data.code).toEqual(PasswordResponses.INCORRECT_PASSWORD);
-          return passwordIncorrectLoadingTask.destroy();
-        });
-
-        var passwordAcceptedLoadingTask = PDFJS.getDocument({
-          url, password: 'asdfasdf',
-        });
-
-        var result3 = passwordAcceptedLoadingTask.promise.then(function (data) {
-          expect(data instanceof PDFDocumentProxy).toEqual(true);
-          return passwordAcceptedLoadingTask.destroy();
-        });
-        Promise.all([result1, result2, result3]).then(function () {
-          done();
-        }).catch(function (reason) {
-          done.fail(reason);
-        });
+      var passwordNeededLoadingTask = getDocument(
+        buildGetDocumentParams(filename, {
+          password: '',
+        }));
+      var result1 = passwordNeededLoadingTask.promise.then(function () {
+        done.fail('shall fail with no password');
+        return Promise.reject(new Error('loadingTask should be rejected'));
+      }, function (data) {
+        expect(data instanceof PasswordException).toEqual(true);
+        expect(data.code).toEqual(PasswordResponses.NEED_PASSWORD);
+        return passwordNeededLoadingTask.destroy();
       });
 
-      it('creates pdf doc from password protected PDF file and aborts/throws ' +
-         'in the onPassword callback (issue 7806)', function (done) {
-        var url = new URL('../pdfs/issue3371.pdf', window.location).href;
-        var passwordNeededLoadingTask = PDFJS.getDocument(url);
-        var passwordIncorrectLoadingTask = PDFJS.getDocument({
-          url, password: 'qwerty',
-        });
+      var passwordIncorrectLoadingTask = getDocument(
+        buildGetDocumentParams(filename, {
+          password: 'qwerty',
+        }));
+      var result2 = passwordIncorrectLoadingTask.promise.then(function () {
+        done.fail('shall fail with wrong password');
+        return Promise.reject(new Error('loadingTask should be rejected'));
+      }, function (data) {
+        expect(data instanceof PasswordException).toEqual(true);
+        expect(data.code).toEqual(PasswordResponses.INCORRECT_PASSWORD);
+        return passwordIncorrectLoadingTask.destroy();
+      });
 
-        let passwordNeededDestroyed;
-        passwordNeededLoadingTask.onPassword = function (callback, reason) {
-          if (reason === PasswordResponses.NEED_PASSWORD) {
-            passwordNeededDestroyed = passwordNeededLoadingTask.destroy();
-            return;
-          }
-          // Shouldn't get here.
-          expect(false).toEqual(true);
-        };
-        var result1 = passwordNeededLoadingTask.promise.then(function () {
-          done.fail('shall fail since the loadingTask should be destroyed');
-          return Promise.reject(new Error('loadingTask should be rejected'));
-        }, function (reason) {
-          expect(reason instanceof PasswordException).toEqual(true);
-          expect(reason.code).toEqual(PasswordResponses.NEED_PASSWORD);
-          return passwordNeededDestroyed;
-        });
+      var passwordAcceptedLoadingTask = getDocument(
+        buildGetDocumentParams(filename, {
+          password: 'asdfasdf',
+        }));
+      var result3 = passwordAcceptedLoadingTask.promise.then(function (data) {
+        expect(data instanceof PDFDocumentProxy).toEqual(true);
+        return passwordAcceptedLoadingTask.destroy();
+      });
+      Promise.all([result1, result2, result3]).then(function () {
+        done();
+      }).catch(function (reason) {
+        done.fail(reason);
+      });
+    });
 
-        passwordIncorrectLoadingTask.onPassword = function (callback, reason) {
-          if (reason === PasswordResponses.INCORRECT_PASSWORD) {
-            throw new Error('Incorrect password');
-          }
-          // Shouldn't get here.
-          expect(false).toEqual(true);
-        };
-        var result2 = passwordIncorrectLoadingTask.promise.then(function () {
-          done.fail('shall fail since the onPassword callback should throw');
-          return Promise.reject(new Error('loadingTask should be rejected'));
-        }, function (reason) {
-          expect(reason instanceof PasswordException).toEqual(true);
-          expect(reason.code).toEqual(PasswordResponses.INCORRECT_PASSWORD);
-          return passwordIncorrectLoadingTask.destroy();
-        });
+    it('creates pdf doc from password protected PDF file and aborts/throws ' +
+       'in the onPassword callback (issue 7806)', function (done) {
+      var filename = 'issue3371.pdf';
 
-        Promise.all([result1, result2]).then(function () {
-          done();
-        }).catch(function (reason) {
-          done.fail(reason);
-        });
+      var passwordNeededLoadingTask = getDocument(
+        buildGetDocumentParams(filename));
+      var passwordIncorrectLoadingTask = getDocument(
+        buildGetDocumentParams(filename, {
+          password: 'qwerty',
+        }));
+
+      let passwordNeededDestroyed;
+      passwordNeededLoadingTask.onPassword = function (callback, reason) {
+        if (reason === PasswordResponses.NEED_PASSWORD) {
+          passwordNeededDestroyed = passwordNeededLoadingTask.destroy();
+          return;
+        }
+        // Shouldn't get here.
+        expect(false).toEqual(true);
+      };
+      var result1 = passwordNeededLoadingTask.promise.then(function () {
+        done.fail('shall fail since the loadingTask should be destroyed');
+        return Promise.reject(new Error('loadingTask should be rejected'));
+      }, function (reason) {
+        expect(reason instanceof PasswordException).toEqual(true);
+        expect(reason.code).toEqual(PasswordResponses.NEED_PASSWORD);
+        return passwordNeededDestroyed;
+      });
+
+      passwordIncorrectLoadingTask.onPassword = function (callback, reason) {
+        if (reason === PasswordResponses.INCORRECT_PASSWORD) {
+          throw new Error('Incorrect password');
+        }
+        // Shouldn't get here.
+        expect(false).toEqual(true);
+      };
+      var result2 = passwordIncorrectLoadingTask.promise.then(function () {
+        done.fail('shall fail since the onPassword callback should throw');
+        return Promise.reject(new Error('loadingTask should be rejected'));
+      }, function (reason) {
+        expect(reason instanceof PasswordException).toEqual(true);
+        expect(reason.code).toEqual(PasswordResponses.INCORRECT_PASSWORD);
+        return passwordIncorrectLoadingTask.destroy();
+      });
+
+      Promise.all([result1, result2]).then(function () {
+        done();
+      }).catch(function (reason) {
+        done.fail(reason);
       });
     });
   });
+
   describe('PDFWorker', function() {
     it('worker created or destroyed', function (done) {
-      var worker = new PDFJS.PDFWorker('test1');
+      if (isNodeJS()) {
+        pending('Worker is not supported in Node.js.');
+      }
+
+      var worker = new PDFWorker({ name: 'test1', });
       worker.promise.then(function () {
         expect(worker.name).toEqual('test1');
         expect(!!worker.port).toEqual(true);
@@ -319,7 +340,11 @@ describe('api', function() {
       });
     });
     it('worker created or destroyed by getDocument', function (done) {
-      var loadingTask = PDFJS.getDocument(basicApiUrl);
+      if (isNodeJS()) {
+        pending('Worker is not supported in Node.js.');
+      }
+
+      var loadingTask = getDocument(basicApiGetDocumentParams);
       var worker;
       loadingTask.promise.then(function () {
         worker = loadingTask._worker;
@@ -339,8 +364,15 @@ describe('api', function() {
       });
     });
     it('worker created and can be used in getDocument', function (done) {
-      var worker = new PDFJS.PDFWorker('test1');
-      var loadingTask = PDFJS.getDocument({ url: basicApiUrl, worker, });
+      if (isNodeJS()) {
+        pending('Worker is not supported in Node.js.');
+      }
+
+      var worker = new PDFWorker({ name: 'test1', });
+      var loadingTask = getDocument(
+        buildGetDocumentParams(basicApiFileName, {
+          worker,
+        }));
       loadingTask.promise.then(function () {
         var docWorker = loadingTask._worker;
         expect(!!docWorker).toEqual(false);
@@ -361,9 +393,13 @@ describe('api', function() {
       });
     });
     it('creates more than one worker', function (done) {
-      var worker1 = new PDFJS.PDFWorker('test1');
-      var worker2 = new PDFJS.PDFWorker('test2');
-      var worker3 = new PDFJS.PDFWorker('test3');
+      if (isNodeJS()) {
+        pending('Worker is not supported in Node.js.');
+      }
+
+      var worker1 = new PDFWorker({ name: 'test1', });
+      var worker2 = new PDFWorker({ name: 'test2', });
+      var worker3 = new PDFWorker({ name: 'test3', });
       var ready = Promise.all([worker1.promise, worker2.promise,
         worker3.promise]);
       ready.then(function () {
@@ -378,13 +414,22 @@ describe('api', function() {
         done.fail(reason);
       });
     });
+    it('gets current workerSrc', function() {
+      if (isNodeJS()) {
+        pending('Worker is not supported in Node.js.');
+      }
+
+      let workerSrc = PDFWorker.getWorkerSrc();
+      expect(typeof workerSrc).toEqual('string');
+      expect(workerSrc).toEqual(GlobalWorkerOptions.workerSrc);
+    });
   });
   describe('PDFDocument', function() {
     var loadingTask;
     var doc;
 
     beforeAll(function(done) {
-      loadingTask = PDFJS.getDocument(basicApiUrl);
+      loadingTask = getDocument(basicApiGetDocumentParams);
       loadingTask.promise.then(function(data) {
         doc = data;
         done();
@@ -443,7 +488,7 @@ describe('api', function() {
     });
     it('gets page index', function(done) {
       // reference to second page
-      var ref = {num: 17, gen: 0};
+      var ref = { num: 17, gen: 0, };
       var promise = doc.getPageIndex(ref);
       promise.then(function(pageIndex) {
         expect(pageIndex).toEqual(1);
@@ -453,7 +498,7 @@ describe('api', function() {
       });
     });
     it('gets invalid page index', function (done) {
-      var ref = { num: 3, gen: 0 }; // Reference to a font dictionary.
+      var ref = { num: 3, gen: 0, }; // Reference to a font dictionary.
       var promise = doc.getPageIndex(ref);
       promise.then(function () {
         done.fail('shall fail for invalid page reference.');
@@ -466,8 +511,9 @@ describe('api', function() {
     it('gets destinations, from /Dests dictionary', function(done) {
       var promise = doc.getDestinations();
       promise.then(function(data) {
-        expect(data).toEqual({ chapter1: [{ gen: 0, num: 17 }, { name: 'XYZ' },
-                                          0, 841.89, null] });
+        expect(data).toEqual({
+          chapter1: [{ gen: 0, num: 17, }, { name: 'XYZ', }, 0, 841.89, null],
+        });
         done();
       }).catch(function (reason) {
         done.fail(reason);
@@ -476,7 +522,7 @@ describe('api', function() {
     it('gets a destination, from /Dests dictionary', function(done) {
       var promise = doc.getDestination('chapter1');
       promise.then(function(data) {
-        expect(data).toEqual([{ gen: 0, num: 17 }, { name: 'XYZ' },
+        expect(data).toEqual([{ gen: 0, num: 17, }, { name: 'XYZ', },
                               0, 841.89, null]);
         done();
       }).catch(function (reason) {
@@ -495,15 +541,14 @@ describe('api', function() {
     });
 
     it('gets destinations, from /Names (NameTree) dictionary', function(done) {
-      var url = new URL('../pdfs/issue6204.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(url);
+      var loadingTask = getDocument(buildGetDocumentParams('issue6204.pdf'));
       var promise = loadingTask.promise.then(function (pdfDocument) {
         return pdfDocument.getDestinations();
       });
       promise.then(function (destinations) {
         expect(destinations).toEqual({
-          'Page.1': [{ num: 1, gen: 0}, { name: 'XYZ' }, 0, 375, null],
-          'Page.2': [{ num: 6, gen: 0}, { name: 'XYZ' }, 0, 375, null],
+          'Page.1': [{ num: 1, gen: 0, }, { name: 'XYZ', }, 0, 375, null],
+          'Page.2': [{ num: 6, gen: 0, }, { name: 'XYZ', }, 0, 375, null],
         });
 
         loadingTask.destroy().then(done);
@@ -512,13 +557,12 @@ describe('api', function() {
       });
     });
     it('gets a destination, from /Names (NameTree) dictionary', function(done) {
-      var url = new URL('../pdfs/issue6204.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(url);
+      var loadingTask = getDocument(buildGetDocumentParams('issue6204.pdf'));
       var promise = loadingTask.promise.then(function (pdfDocument) {
         return pdfDocument.getDestination('Page.1');
       });
       promise.then(function (destination) {
-        expect(destination).toEqual([{ num: 1, gen: 0}, { name: 'XYZ' },
+        expect(destination).toEqual([{ num: 1, gen: 0, }, { name: 'XYZ', },
                                      0, 375, null]);
 
         loadingTask.destroy().then(done);
@@ -528,8 +572,7 @@ describe('api', function() {
     });
     it('gets a non-existent destination, from /Names (NameTree) dictionary',
         function(done) {
-      var url = new URL('../pdfs/issue6204.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(url);
+      var loadingTask = getDocument(buildGetDocumentParams('issue6204.pdf'));
       var promise = loadingTask.promise.then(function (pdfDocument) {
         return pdfDocument.getDestination('non-existent-named-destination');
       });
@@ -553,29 +596,26 @@ describe('api', function() {
     });
     it('gets page labels', function (done) {
       // PageLabels with Roman/Arabic numerals.
-      var url0 = new URL('../pdfs/bug793632.pdf', window.location).href;
-      var loadingTask0 = PDFJS.getDocument(url0);
+      var loadingTask0 = getDocument(buildGetDocumentParams('bug793632.pdf'));
       var promise0 = loadingTask0.promise.then(function (pdfDoc) {
         return pdfDoc.getPageLabels();
       });
 
       // PageLabels with only a label prefix.
-      var url1 = new URL('../pdfs/issue1453.pdf', window.location).href;
-      var loadingTask1 = PDFJS.getDocument(url1);
+      var loadingTask1 = getDocument(buildGetDocumentParams('issue1453.pdf'));
       var promise1 = loadingTask1.promise.then(function (pdfDoc) {
         return pdfDoc.getPageLabels();
       });
 
       // PageLabels identical to standard page numbering.
-      var url2 = new URL('../pdfs/rotation.pdf', window.location).href;
-      var loadingTask2 = PDFJS.getDocument(url2);
+      var loadingTask2 = getDocument(buildGetDocumentParams('rotation.pdf'));
       var promise2 = loadingTask2.promise.then(function (pdfDoc) {
         return pdfDoc.getPageLabels();
       });
 
       // PageLabels with bad "Prefix" entries.
-      var url3 = new URL('../pdfs/bad-PageLabels.pdf', window.location).href;
-      var loadingTask3 = PDFJS.getDocument(url3);
+      var loadingTask3 = getDocument(
+        buildGetDocumentParams('bad-PageLabels.pdf'));
       var promise3 = loadingTask3.promise.then(function (pdfDoc) {
         return pdfDoc.getPageLabels();
       });
@@ -598,6 +638,28 @@ describe('api', function() {
       });
     });
 
+    it('gets default page mode', function(done) {
+      var loadingTask = getDocument(buildGetDocumentParams('tracemonkey.pdf'));
+
+      loadingTask.promise.then(function(pdfDocument) {
+        return pdfDocument.getPageMode();
+      }).then(function(mode) {
+        expect(mode).toEqual('UseNone');
+
+        loadingTask.destroy().then(done);
+      }).catch(function (reason) {
+        done.fail(reason);
+      });
+    });
+    it('gets non-default page mode', function(done) {
+      doc.getPageMode().then(function(mode) {
+        expect(mode).toEqual('UseOutlines');
+        done();
+      }).catch(function(reason) {
+        done.fail(reason);
+      });
+    });
+
     it('gets non-existent attachments', function(done) {
       var promise = doc.getAttachments();
       promise.then(function (data) {
@@ -608,8 +670,10 @@ describe('api', function() {
       });
     });
     it('gets attachments', function(done) {
-      var url = new URL('../pdfs/bug766138.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(url);
+      if (isNodeJS()) { // The PDF file used is a linked test-case.
+        pending('TODO: Use a non-linked test-case.');
+      }
+      var loadingTask = getDocument(buildGetDocumentParams('bug766138.pdf'));
       var promise = loadingTask.promise.then(function (pdfDoc) {
         return pdfDoc.getAttachments();
       });
@@ -628,7 +692,7 @@ describe('api', function() {
     it('gets javascript', function(done) {
       var promise = doc.getJavaScript();
       promise.then(function (data) {
-        expect(data).toEqual([]);
+        expect(data).toEqual(null);
         done();
       }).catch(function (reason) {
         done.fail(reason);
@@ -640,8 +704,7 @@ describe('api', function() {
     it('gets javascript with printing instructions (Print action)',
         function(done) {
       // PDF document with "Print" Named action in OpenAction
-      var pdfUrl = new URL('../pdfs/bug1001080.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(pdfUrl);
+      var loadingTask = getDocument(buildGetDocumentParams('bug1001080.pdf'));
       var promise = loadingTask.promise.then(function(doc) {
         return doc.getJavaScript();
       });
@@ -656,8 +719,7 @@ describe('api', function() {
     it('gets javascript with printing instructions (JS action)',
         function(done) {
       // PDF document with "JavaScript" action in OpenAction
-      var pdfUrl = new URL('../pdfs/issue6106.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(pdfUrl);
+      var loadingTask = getDocument(buildGetDocumentParams('issue6106.pdf'));
       var promise = loadingTask.promise.then(function(doc) {
         return doc.getJavaScript();
       });
@@ -671,8 +733,7 @@ describe('api', function() {
       });
     });
     it('gets non-existent outline', function(done) {
-      var url = new URL('../pdfs/tracemonkey.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(url);
+      var loadingTask = getDocument(buildGetDocumentParams('tracemonkey.pdf'));
 
       var promise = loadingTask.promise.then(function (pdfDocument) {
         return pdfDocument.getOutline();
@@ -711,8 +772,7 @@ describe('api', function() {
       });
     });
     it('gets outline containing a url', function(done) {
-      var pdfUrl = new URL('../pdfs/issue3214.pdf', window.location).href;
-      var loadingTask = PDFJS.getDocument(pdfUrl);
+      var loadingTask = getDocument(buildGetDocumentParams('issue3214.pdf'));
 
       loadingTask.promise.then(function (pdfDocument) {
         pdfDocument.getOutline().then(function (outline) {
@@ -743,6 +803,7 @@ describe('api', function() {
         expect(metadata.info['Title']).toEqual('Basic API Test');
         expect(metadata.info['PDFFormatVersion']).toEqual('1.7');
         expect(metadata.metadata.get('dc:title')).toEqual('Basic API Test');
+        expect(metadata.contentDispositionFilename).toEqual(null);
         done();
       }).catch(function (reason) {
         done.fail(reason);
@@ -761,7 +822,7 @@ describe('api', function() {
     it('gets download info', function(done) {
       var promise = doc.getDownloadInfo();
       promise.then(function (data) {
-        expect(data).toEqual({ length: basicApiFileLength });
+        expect(data).toEqual({ length: basicApiFileLength, });
         done();
       }).catch(function (reason) {
         done.fail(reason);
@@ -770,7 +831,7 @@ describe('api', function() {
     it('gets stats', function(done) {
       var promise = doc.getStats();
       promise.then(function (stats) {
-        expect(stats).toEqual({ streamTypes: [], fontTypes: [] });
+        expect(stats).toEqual({ streamTypes: [], fontTypes: [], });
         done();
       }).catch(function (reason) {
         done.fail(reason);
@@ -778,11 +839,9 @@ describe('api', function() {
     });
 
     it('checks that fingerprints are unique', function(done) {
-      var url1 = new URL('../pdfs/issue4436r.pdf', window.location).href;
-      var loadingTask1 = PDFJS.getDocument(url1);
+      var loadingTask1 = getDocument(buildGetDocumentParams('issue4436r.pdf'));
 
-      var url2 = new URL('../pdfs/issue4575.pdf', window.location).href;
-      var loadingTask2 = PDFJS.getDocument(url2);
+      var loadingTask2 = getDocument(buildGetDocumentParams('issue4575.pdf'));
 
       var promises = [loadingTask1.promise,
                       loadingTask2.promise];
@@ -805,13 +864,92 @@ describe('api', function() {
         done.fail(reason);
       });
     });
+
+    describe('Cross-origin', function() {
+      var loadingTask;
+      function _checkCanLoad(expectSuccess, filename, options) {
+        if (isNodeJS()) {
+          pending('Cannot simulate cross-origin requests in Node.js');
+        }
+        var params = buildGetDocumentParams(filename, options);
+        var url = new URL(params.url);
+        if (url.hostname === 'localhost') {
+          url.hostname = '127.0.0.1';
+        } else if (params.url.hostname === '127.0.0.1') {
+          url.hostname = 'localhost';
+        } else {
+          pending('Can only run cross-origin test on localhost!');
+        }
+        params.url = url.href;
+        loadingTask = getDocument(params);
+        return loadingTask.promise.then(function(pdf) {
+          return pdf.destroy();
+        }).then(function() {
+          expect(expectSuccess).toEqual(true);
+        }, function(error) {
+          if (expectSuccess) {
+            // For ease of debugging.
+            expect(error).toEqual('There should not be any error');
+          }
+          expect(expectSuccess).toEqual(false);
+        });
+      }
+      function testCanLoad(filename, options) {
+        return _checkCanLoad(true, filename, options);
+      }
+      function testCannotLoad(filename, options) {
+        return _checkCanLoad(false, filename, options);
+      }
+      afterEach(function(done) {
+        if (loadingTask) {
+          loadingTask.destroy().then(done);
+        } else {
+          done();
+        }
+      });
+      it('server disallows cors', function(done) {
+        testCannotLoad('basicapi.pdf').then(done);
+      });
+      it('server allows cors without credentials, default withCredentials',
+          function(done) {
+        testCanLoad('basicapi.pdf?cors=withoutCredentials').then(done);
+      });
+      it('server allows cors without credentials, and withCredentials=false',
+          function(done) {
+        testCanLoad('basicapi.pdf?cors=withoutCredentials', {
+          withCredentials: false,
+        }).then(done);
+      });
+      it('server allows cors without credentials, but withCredentials=true',
+          function(done) {
+        testCannotLoad('basicapi.pdf?cors=withoutCredentials', {
+          withCredentials: true,
+        }).then(done);
+      });
+      it('server allows cors with credentials, and withCredentials=true',
+          function(done) {
+        testCanLoad('basicapi.pdf?cors=withCredentials', {
+          withCredentials: true,
+        }).then(done);
+      });
+      it('server allows cors with credentials, and withCredentials=false',
+          function(done) {
+        // The server supports even more than we need, so if the previous tests
+        // pass, then this should pass for sure.
+        // The only case where this test fails is when the server does not reply
+        // with the Access-Control-Allow-Origin header.
+        testCanLoad('basicapi.pdf?cors=withCredentials', {
+          withCredentials: false,
+        }).then(done);
+      });
+    });
   });
   describe('Page', function() {
     var loadingTask;
     var pdfDocument, page;
 
     beforeAll(function(done) {
-      loadingTask = PDFJS.getDocument(basicApiUrl);
+      loadingTask = getDocument(basicApiGetDocumentParams);
       loadingTask.promise.then(function(doc) {
         pdfDocument = doc;
         pdfDocument.getPage(1).then(function(data) {
@@ -834,7 +972,7 @@ describe('api', function() {
       expect(page.rotate).toEqual(0);
     });
     it('gets ref', function () {
-      expect(page.ref).toEqual({ num: 15, gen: 0 });
+      expect(page.ref).toEqual({ num: 15, gen: 0, });
     });
     it('gets userUnit', function () {
       expect(page.userUnit).toEqual(1.0);
@@ -851,17 +989,29 @@ describe('api', function() {
       expect(viewport.width).toEqual(1262.835);
       expect(viewport.height).toEqual(892.92);
     });
+    it('gets viewport respecting "dontFlip" argument', function () {
+      const scale = 1;
+      const rotation = 135;
+      let viewport = page.getViewport(scale, rotation);
+      let dontFlipViewport = page.getViewport(scale, rotation, true);
+
+      expect(dontFlipViewport).not.toEqual(viewport);
+      expect(dontFlipViewport).toEqual(viewport.clone({ dontFlip: true, }));
+
+      expect(viewport.transform).toEqual([1, 0, 0, -1, 0, 841.89]);
+      expect(dontFlipViewport.transform).toEqual([1, 0, -0, 1, 0, 0]);
+    });
     it('gets annotations', function (done) {
       var defaultPromise = page.getAnnotations().then(function (data) {
         expect(data.length).toEqual(4);
       });
 
-      var displayPromise = page.getAnnotations({ intent: 'display' }).then(
+      var displayPromise = page.getAnnotations({ intent: 'display', }).then(
           function (data) {
         expect(data.length).toEqual(4);
       });
 
-      var printPromise = page.getAnnotations({ intent: 'print' }).then(
+      var printPromise = page.getAnnotations({ intent: 'print', }).then(
           function (data) {
         expect(data.length).toEqual(4);
       });
@@ -875,19 +1025,19 @@ describe('api', function() {
 
     it('gets annotations containing relative URLs (bug 766086)',
         function (done) {
-      var url = new URL('../pdfs/bug766086.pdf', window.location).href;
+      var filename = 'bug766086.pdf';
 
-      var defaultLoadingTask = PDFJS.getDocument(url);
+      var defaultLoadingTask = getDocument(buildGetDocumentParams(filename));
       var defaultPromise = defaultLoadingTask.promise.then(function (pdfDoc) {
         return pdfDoc.getPage(1).then(function (pdfPage) {
           return pdfPage.getAnnotations();
         });
       });
 
-      var docBaseUrlLoadingTask = PDFJS.getDocument({
-        url,
-        docBaseUrl: 'http://www.example.com/test/pdfs/qwerty.pdf',
-      });
+      var docBaseUrlLoadingTask = getDocument(
+        buildGetDocumentParams(filename, {
+          docBaseUrl: 'http://www.example.com/test/pdfs/qwerty.pdf',
+        }));
       var docBaseUrlPromise = docBaseUrlLoadingTask.promise.then(
           function (pdfDoc) {
         return pdfDoc.getPage(1).then(function (pdfPage) {
@@ -895,10 +1045,10 @@ describe('api', function() {
         });
       });
 
-      var invalidDocBaseUrlLoadingTask = PDFJS.getDocument({
-        url,
-        docBaseUrl: 'qwerty.pdf',
-      });
+      var invalidDocBaseUrlLoadingTask = getDocument(
+        buildGetDocumentParams(filename, {
+          docBaseUrl: 'qwerty.pdf',
+        }));
       var invalidDocBaseUrlPromise = invalidDocBaseUrlLoadingTask.promise.then(
           function (pdfDoc) {
         return pdfDoc.getPage(1).then(function (pdfPage) {
@@ -914,16 +1064,16 @@ describe('api', function() {
 
         expect(defaultAnnotations[0].url).toBeUndefined();
         expect(defaultAnnotations[0].unsafeUrl).toEqual(
-          '../../0021/002156/215675E.pdf#nameddest=15');
+          '../../0021/002156/215675E.pdf#15');
 
         expect(docBaseUrlAnnotations[0].url).toEqual(
-          'http://www.example.com/0021/002156/215675E.pdf#nameddest=15');
+          'http://www.example.com/0021/002156/215675E.pdf#15');
         expect(docBaseUrlAnnotations[0].unsafeUrl).toEqual(
-          '../../0021/002156/215675E.pdf#nameddest=15');
+          '../../0021/002156/215675E.pdf#15');
 
         expect(invalidDocBaseUrlAnnotations[0].url).toBeUndefined();
         expect(invalidDocBaseUrlAnnotations[0].unsafeUrl).toEqual(
-          '../../0021/002156/215675E.pdf#nameddest=15');
+          '../../0021/002156/215675E.pdf#15');
 
         Promise.all([
           defaultLoadingTask.destroy(),
@@ -969,6 +1119,25 @@ describe('api', function() {
         done.fail(reason);
       });
     });
+    it('gets operatorList with JPEG image (issue 4888)', function(done) {
+      let loadingTask = getDocument(buildGetDocumentParams('cmykjpeg.pdf'));
+
+      loadingTask.promise.then((pdfDoc) => {
+        pdfDoc.getPage(1).then((pdfPage) => {
+          pdfPage.getOperatorList().then((opList) => {
+            let imgIndex = opList.fnArray.indexOf(OPS.paintImageXObject);
+            let imgArgs = opList.argsArray[imgIndex];
+            let { data: imgData, } = pdfPage.objs.get(imgArgs[0]);
+
+            expect(imgData instanceof Uint8ClampedArray).toEqual(true);
+            expect(imgData.length).toEqual(90000);
+            done();
+          });
+        });
+      }).catch(function (reason) {
+        done.fail(reason);
+      });
+    });
     it('gets stats after parsing page', function (done) {
       var promise = page.getOperatorList().then(function () {
         return pdfDocument.getStats();
@@ -981,7 +1150,7 @@ describe('api', function() {
 
       promise.then(function (stats) {
         expect(stats).toEqual({ streamTypes: expectedStreamTypes,
-                                fontTypes: expectedFontTypes });
+                                fontTypes: expectedFontTypes, });
         done();
       }).catch(function (reason) {
         done.fail(reason);
@@ -989,6 +1158,9 @@ describe('api', function() {
     });
 
     it('cancels rendering of page', function(done) {
+      if (isNodeJS()) {
+        pending('TODO: Support Canvas testing in Node.js.');
+      }
       var viewport = page.getViewport(1);
       var canvasAndCtx = CanvasFactory.create(viewport.width, viewport.height);
 
@@ -1007,22 +1179,48 @@ describe('api', function() {
         done();
       });
     });
+    it('multiple render() on the same canvas', function(done) {
+      if (isNodeJS()) {
+        pending('TODO: Support Canvas testing in Node.js.');
+      }
+      var viewport = page.getViewport(1);
+      var canvasAndCtx = CanvasFactory.create(viewport.width, viewport.height);
+
+      var renderTask1 = page.render({
+        canvasContext: canvasAndCtx.context,
+        viewport,
+      });
+      var renderTask2 = page.render({
+        canvasContext: canvasAndCtx.context,
+        viewport,
+      });
+
+      Promise.all([
+        renderTask1.promise,
+        renderTask2.promise.then(() => {
+          done.fail('shall fail rendering');
+        }, (reason) => {
+          /* it fails because we already using this canvas */
+          expect(/multiple render\(\)/.test(reason.message)).toEqual(true);
+        })
+      ]).then(done);
+    });
   });
-  describe('Multiple PDFJS instances', function() {
+  describe('Multiple `getDocument` instances', function() {
     // Regression test for https://github.com/mozilla/pdf.js/issues/6205
     // A PDF using the Helvetica font.
-    var pdf1 = new URL('../pdfs/tracemonkey.pdf', window.location).href;
+    var pdf1 = buildGetDocumentParams('tracemonkey.pdf');
     // A PDF using the Times font.
-    var pdf2 = new URL('../pdfs/TAMReview.pdf', window.location).href;
+    var pdf2 = buildGetDocumentParams('TAMReview.pdf');
     // A PDF using the Arial font.
-    var pdf3 = new URL('../pdfs/issue6068.pdf', window.location).href;
+    var pdf3 = buildGetDocumentParams('issue6068.pdf');
     var loadingTasks = [];
     var pdfDocuments = [];
 
     // Render the first page of the given PDF file.
     // Fulfills the promise with the base64-encoded version of the PDF.
     function renderPDF(filename) {
-      var loadingTask = PDFJS.getDocument(filename);
+      var loadingTask = getDocument(filename);
       loadingTasks.push(loadingTask);
       return loadingTask.promise
         .then(function(pdf) {
@@ -1062,6 +1260,10 @@ describe('api', function() {
     });
 
     it('should correctly render PDFs in parallel', function(done) {
+      if (isNodeJS()) {
+        pending('TODO: Support Canvas testing in Node.js.');
+      }
+
       var baseline1, baseline2, baseline3;
       var promiseDone = renderPDF(pdf1).then(function(data1) {
         baseline1 = data1;
@@ -1090,9 +1292,9 @@ describe('api', function() {
     });
   });
   describe('PDFDataRangeTransport', function () {
-    var pdfPath = new URL('../pdfs/tracemonkey.pdf', window.location).href;
     var loadPromise;
     function getDocumentData() {
+      const pdfPath = new URL('../pdfs/tracemonkey.pdf', window.location).href;
       if (loadPromise) {
         return loadPromise;
       }
@@ -1111,12 +1313,16 @@ describe('api', function() {
       return loadPromise;
     }
     it('should fetch document info and page using ranges', function (done) {
+      if (isNodeJS()) {
+        pending('XMLHttpRequest is not supported in Node.js.');
+      }
+
       var transport;
       var initialDataLength = 4000;
       var fetches = 0;
       var getDocumentPromise = getDocumentData().then(function (data) {
         var initialData = data.subarray(0, initialDataLength);
-        transport = new PDFJS.PDFDataRangeTransport(data.length, initialData);
+        transport = new PDFDataRangeTransport(data.length, initialData);
         transport.requestDataRange = function (begin, end) {
           fetches++;
           waitSome(function () {
@@ -1124,7 +1330,7 @@ describe('api', function() {
             transport.onDataRange(begin, data.subarray(begin, end));
           });
         };
-        var loadingTask = PDFJS.getDocument(transport);
+        var loadingTask = getDocument(transport);
         return loadingTask.promise;
       });
       var pdfDocument;
@@ -1145,12 +1351,16 @@ describe('api', function() {
     });
     it('should fetch document info and page using range and streaming',
         function (done) {
+      if (isNodeJS()) {
+        pending('XMLHttpRequest is not supported in Node.js.');
+      }
+
       var transport;
       var initialDataLength = 4000;
       var fetches = 0;
       var getDocumentPromise = getDocumentData().then(function (data) {
         var initialData = data.subarray(0, initialDataLength);
-        transport = new PDFJS.PDFDataRangeTransport(data.length, initialData);
+        transport = new PDFDataRangeTransport(data.length, initialData);
         transport.requestDataRange = function (begin, end) {
           fetches++;
           if (fetches === 1) {
@@ -1161,7 +1371,7 @@ describe('api', function() {
             transport.onDataRange(begin, data.subarray(begin, end));
           });
         };
-        var loadingTask = PDFJS.getDocument(transport);
+        var loadingTask = getDocument(transport);
         return loadingTask.promise;
       });
       var pdfDocument;

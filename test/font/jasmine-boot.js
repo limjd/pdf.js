@@ -73,12 +73,12 @@ function initializePDFJS(callback) {
   var queryString = new jasmine.QueryString({
     getWindowLocation() {
       return window.location;
-    }
+    },
   });
 
-  var catchingExceptions = queryString.getParam('catch');
-  env.catchExceptions(typeof catchingExceptions === 'undefined' ?
-                      true : catchingExceptions);
+  var stoppingOnSpecFailure = queryString.getParam('failFast');
+  env.stopOnSpecFailure(typeof stoppingOnSpecFailure === 'undefined' ?
+                        false : stoppingOnSpecFailure);
 
   var throwingExpectationFailures = queryString.getParam('throwFailures');
   env.throwOnExpectationFailure(throwingExpectationFailures);
@@ -94,8 +94,9 @@ function initializePDFJS(callback) {
   // Reporters
   var htmlReporter = new jasmine.HtmlReporter({
     env,
-    onRaiseExceptionsClick() {
-      queryString.navigateWithNewParam('catch', !env.catchingExceptions());
+    onStopExecutionClick() {
+      queryString.navigateWithNewParam('failFast',
+                                       env.stoppingOnSpecFailure());
     },
     onThrowExpectationsClick() {
       queryString.navigateWithNewParam('throwFailures',
@@ -116,7 +117,7 @@ function initializePDFJS(callback) {
     createTextNode() {
       return document.createTextNode.apply(document, arguments);
     },
-    timer: new jasmine.Timer()
+    timer: new jasmine.Timer(),
   });
 
   env.addReporter(htmlReporter);
@@ -132,7 +133,7 @@ function initializePDFJS(callback) {
   var specFilter = new jasmine.HtmlSpecFilter({
     filterString() {
       return queryString.getParam('spec');
-    }
+    },
   });
 
   env.specFilter = function(spec) {

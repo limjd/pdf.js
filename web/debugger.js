@@ -12,6 +12,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+/* eslint-disable no-var */
 
 'use strict';
 
@@ -119,7 +120,7 @@ var FontInspector = (function FontInspectorClosure() {
         download.href = url[1];
       } else if (fontObj.data) {
         url = URL.createObjectURL(new Blob([fontObj.data], {
-          type: fontObj.mimeType
+          type: fontObj.mimeType,
         }));
         download.href = url;
       }
@@ -154,7 +155,7 @@ var FontInspector = (function FontInspectorClosure() {
           resetSelection();
         }
       }, 2000);
-    }
+    },
   };
 })();
 
@@ -243,7 +244,7 @@ var StepperManager = (function StepperManagerClosure() {
     saveBreakPoints: function saveBreakPoints(pageIndex, bps) {
       breakPoints[pageIndex] = bps;
       sessionStorage.setItem('pdfjsBreakPoints', JSON.stringify(breakPoints));
-    }
+    },
   };
 })();
 
@@ -337,7 +338,7 @@ var Stepper = (function StepperClosure() {
         line.className = 'line';
         line.dataset.idx = i;
         chunk.appendChild(line);
-        var checked = this.breakPoints.indexOf(i) !== -1;
+        var checked = this.breakPoints.includes(i);
         var args = operatorList.argsArray[i] || [];
 
         var breakCell = c('td');
@@ -433,7 +434,7 @@ var Stepper = (function StepperClosure() {
           row.style.backgroundColor = null;
         }
       }
-    }
+    },
   };
   return Stepper;
 })();
@@ -461,7 +462,6 @@ var Stats = (function Stats() {
     manager: null,
     init(pdfjsLib) {
       this.panel.setAttribute('style', 'padding: 5px;');
-      pdfjsLib.PDFJS.enableStats = true;
     },
     enabled: false,
     active: false,
@@ -497,7 +497,7 @@ var Stats = (function Stats() {
     cleanup() {
       stats = [];
       clear(this.panel);
-    }
+    },
   };
 })();
 
@@ -520,7 +520,7 @@ window.PDFBug = (function PDFBugClosure() {
       }
       for (var i = 0; i < tools.length; ++i) {
         var tool = tools[i];
-        if (all || ids.indexOf(tool.id) !== -1) {
+        if (all || ids.includes(tool.id)) {
           tool.enabled = true;
         }
       }
@@ -615,6 +615,6 @@ window.PDFBug = (function PDFBugClosure() {
           tools[j].panel.setAttribute('hidden', 'true');
         }
       }
-    }
+    },
   };
 })();

@@ -13,11 +13,34 @@
  * limitations under the License.
  */
 
-import { cloneObj, getPDFFileNameFromURL, mozL10n } from './ui_utils';
-import { createPromiseCapability } from './pdfjs';
-import { OverlayManager } from './overlay_manager';
+import {
+  cloneObj, getPageSizeInches, getPDFFileNameFromURL, isPortraitOrientation,
+  NullL10n
+} from './ui_utils';
+import { createPromiseCapability } from 'pdfjs-lib';
 
 const DEFAULT_FIELD_CONTENT = '-';
+
+// See https://en.wikibooks.org/wiki/Lentis/Conversion_to_the_Metric_Standard_in_the_United_States
+const NON_METRIC_LOCALES = ['en-us', 'en-lr', 'my'];
+
+// Should use the format: `width x height`, in portrait orientation.
+// See https://en.wikipedia.org/wiki/Paper_size
+const US_PAGE_NAMES = {
+  '8.5x11': 'Letter',
+  '8.5x14': 'Legal',
+};
+const METRIC_PAGE_NAMES = {
+  '297x420': 'A3',
+  '210x297': 'A4',
+};
+
+function getPageName(size, isPortrait, pageNames) {
+  const width = (isPortrait ? size.width : size.height);
+  const height = (isPortrait ? size.height : size.width);
+
+  return pageNames[`${width}x${height}`];
+}
 
 /**
  * @typedef {Object} PDFDocumentPropertiesOptions
@@ -30,19 +53,39 @@ const DEFAULT_FIELD_CONTENT = '-';
 class PDFDocumentProperties {
   /**
    * @param {PDFDocumentPropertiesOptions} options
+   * @param {OverlayManager} overlayManager - Manager for the viewer overlays.
+   * @param {EventBus} eventBus - The application event bus.
+   * @param {IL10n} l10n - Localization service.
    */
-  constructor({ overlayName, fields, container, closeButton, }) {
+  constructor({ overlayName, fields, container, closeButton, },
+              overlayManager, eventBus, l10n = NullL10n) {
     this.overlayName = overlayName;
     this.fields = fields;
     this.container = container;
+    this.overlayManager = overlayManager;
+    this.l10n = l10n;
 
     this._reset();
 
     if (closeButton) { // Bind the event listener for the Close button.
       closeButton.addEventListener('click', this.close.bind(this));
     }
-    OverlayManager.register(this.overlayName, this.container,
-                            this.close.bind(this));
+    this.overlayManager.register(this.overlayName, this.container,
+                                 this.close.bind(this));
+
+    if (eventBus) {
+      eventBus.on('pagechanging', (evt) => {
+        this._currentPageNumber = evt.pageNumber;
+      });
+      eventBus.on('rotationchanging', (evt) => {
+        this._pagesRotation = evt.pagesRotation;
+      });
+    }
+
+    this._isNonMetricLocale = true; // The default viewer locale is 'en-us'.
+    l10n.getLanguage().then((locale) => {
+      this._isNonMetricLocale = NON_METRIC_LOCALES.includes(locale);
+    });
   }
 
   /**
@@ -58,29 +101,53 @@ class PDFDocumentProperties {
       });
     };
 
-    Promise.all([OverlayManager.open(this.overlayName),
+    Promise.all([this.overlayManager.open(this.overlayName),
                  this._dataAvailableCapability.promise]).then(() => {
+      const currentPageNumber = this._currentPageNumber;
+      const pagesRotation = this._pagesRotation;
+
       // If the document properties were previously fetched (for this PDF file),
       // just update the dialog immediately to avoid redundant lookups.
-      if (this.fieldData) {
+      if (this.fieldData &&
+          currentPageNumber === this.fieldData['_currentPageNumber'] &&
+          pagesRotation === this.fieldData['_pagesRotation']) {
         this._updateUI();
         return;
       }
+
       // Get the document properties.
-      this.pdfDocument.getMetadata().then(({ info, metadata, }) => {
+      this.pdfDocument.getMetadata().then(
+          ({ info, metadata, contentDispositionFilename, }) => {
+        return Promise.all([
+          info,
+          metadata,
+          contentDispositionFilename || getPDFFileNameFromURL(this.url),
+          this._parseFileSize(this.maybeFileSize),
+          this._parseDate(info.CreationDate),
+          this._parseDate(info.ModDate),
+          this.pdfDocument.getPage(currentPageNumber).then((pdfPage) => {
+            return this._parsePageSize(getPageSizeInches(pdfPage),
+                                       pagesRotation);
+          }),
+        ]);
+      }).then(([info, metadata, fileName, fileSize, creationDate, modDate,
+                pageSize]) => {
         freezeFieldData({
-          'fileName': getPDFFileNameFromURL(this.url),
-          'fileSize': this._parseFileSize(this.maybeFileSize),
+          'fileName': fileName,
+          'fileSize': fileSize,
           'title': info.Title,
           'author': info.Author,
           'subject': info.Subject,
           'keywords': info.Keywords,
-          'creationDate': this._parseDate(info.CreationDate),
-          'modificationDate': this._parseDate(info.ModDate),
+          'creationDate': creationDate,
+          'modificationDate': modDate,
           'creator': info.Creator,
           'producer': info.Producer,
           'version': info.PDFFormatVersion,
           'pageCount': this.pdfDocument.numPages,
+          'pageSize': pageSize,
+          '_currentPageNumber': currentPageNumber,
+          '_pagesRotation': pagesRotation,
         });
         this._updateUI();
 
@@ -88,8 +155,14 @@ class PDFDocumentProperties {
         // `this.setFileSize` wasn't called) or may be incorrectly set.
         return this.pdfDocument.getDownloadInfo();
       }).then(({ length, }) => {
+        this.maybeFileSize = length;
+        return this._parseFileSize(length);
+      }).then((fileSize) => {
+        if (fileSize === this.fieldData['fileSize']) {
+          return; // The fileSize has already been correctly set.
+        }
         let data = cloneObj(this.fieldData);
-        data['fileSize'] = this._parseFileSize(length);
+        data['fileSize'] = fileSize;
 
         freezeFieldData(data);
         this._updateUI();
@@ -101,7 +174,7 @@ class PDFDocumentProperties {
    * Close the document properties overlay.
    */
   close() {
-    OverlayManager.close(this.overlayName);
+    this.overlayManager.close(this.overlayName);
   }
 
   /**
@@ -135,7 +208,7 @@ class PDFDocumentProperties {
    * @param {number} fileSize - The file size of the PDF document.
    */
   setFileSize(fileSize) {
-    if (typeof fileSize === 'number' && fileSize > 0) {
+    if (Number.isInteger(fileSize) && fileSize > 0) {
       this.maybeFileSize = fileSize;
     }
   }
@@ -150,6 +223,8 @@ class PDFDocumentProperties {
     this.maybeFileSize = 0;
     delete this.fieldData;
     this._dataAvailableCapability = createPromiseCapability();
+    this._currentPageNumber = 1;
+    this._pagesRotation = 0;
   }
 
   /**
@@ -165,7 +240,7 @@ class PDFDocumentProperties {
       }
       return;
     }
-    if (OverlayManager.active !== this.overlayName) {
+    if (this.overlayManager.active !== this.overlayName) {
       // Don't bother updating the dialog if has already been closed,
       // since it will be updated the next time `this.open` is called.
       return;
@@ -183,17 +258,104 @@ class PDFDocumentProperties {
   _parseFileSize(fileSize = 0) {
     let kb = fileSize / 1024;
     if (!kb) {
-      return;
+      return Promise.resolve(undefined);
     } else if (kb < 1024) {
-      return mozL10n.get('document_properties_kb', {
+      return this.l10n.get('document_properties_kb', {
         size_kb: (+kb.toPrecision(3)).toLocaleString(),
-        size_b: fileSize.toLocaleString()
+        size_b: fileSize.toLocaleString(),
       }, '{{size_kb}} KB ({{size_b}} bytes)');
     }
-    return mozL10n.get('document_properties_mb', {
+    return this.l10n.get('document_properties_mb', {
       size_mb: (+(kb / 1024).toPrecision(3)).toLocaleString(),
-      size_b: fileSize.toLocaleString()
+      size_b: fileSize.toLocaleString(),
     }, '{{size_mb}} MB ({{size_b}} bytes)');
+  }
+
+  /**
+   * @private
+   */
+  _parsePageSize(pageSizeInches, pagesRotation) {
+    if (!pageSizeInches) {
+      return Promise.resolve(undefined);
+    }
+    // Take the viewer rotation into account as well; compare with Adobe Reader.
+    if (pagesRotation % 180 !== 0) {
+      pageSizeInches = {
+        width: pageSizeInches.height,
+        height: pageSizeInches.width,
+      };
+    }
+    const isPortrait = isPortraitOrientation(pageSizeInches);
+
+    let sizeInches = {
+      width: Math.round(pageSizeInches.width * 100) / 100,
+      height: Math.round(pageSizeInches.height * 100) / 100,
+    };
+    // 1in == 25.4mm; no need to round to 2 decimals for millimeters.
+    let sizeMillimeters = {
+      width: Math.round(pageSizeInches.width * 25.4 * 10) / 10,
+      height: Math.round(pageSizeInches.height * 25.4 * 10) / 10,
+    };
+
+    let pageName = null;
+    let name = getPageName(sizeInches, isPortrait, US_PAGE_NAMES) ||
+               getPageName(sizeMillimeters, isPortrait, METRIC_PAGE_NAMES);
+
+    if (!name && !(Number.isInteger(sizeMillimeters.width) &&
+                   Number.isInteger(sizeMillimeters.height))) {
+      // Attempt to improve the page name detection by falling back to fuzzy
+      // matching of the metric dimensions, to account for e.g. rounding errors
+      // and/or PDF files that define the page sizes in an imprecise manner.
+      const exactMillimeters = {
+        width: pageSizeInches.width * 25.4,
+        height: pageSizeInches.height * 25.4,
+      };
+      const intMillimeters = {
+        width: Math.round(sizeMillimeters.width),
+        height: Math.round(sizeMillimeters.height),
+      };
+
+      // Try to avoid false positives, by only considering "small" differences.
+      if (Math.abs(exactMillimeters.width - intMillimeters.width) < 0.1 &&
+          Math.abs(exactMillimeters.height - intMillimeters.height) < 0.1) {
+
+        name = getPageName(intMillimeters, isPortrait, METRIC_PAGE_NAMES);
+        if (name) {
+          // Update *both* sizes, computed above, to ensure that the displayed
+          // dimensions always correspond to the detected page name.
+          sizeInches = {
+            width: Math.round(intMillimeters.width / 25.4 * 100) / 100,
+            height: Math.round(intMillimeters.height / 25.4 * 100) / 100,
+          };
+          sizeMillimeters = intMillimeters;
+        }
+      }
+    }
+    if (name) {
+      pageName = this.l10n.get('document_properties_page_size_name_' +
+                               name.toLowerCase(), null, name);
+    }
+
+    return Promise.all([
+      (this._isNonMetricLocale ? sizeInches : sizeMillimeters),
+      this.l10n.get('document_properties_page_size_unit_' +
+                    (this._isNonMetricLocale ? 'inches' : 'millimeters'), null,
+                    this._isNonMetricLocale ? 'in' : 'mm'),
+      pageName,
+      this.l10n.get('document_properties_page_size_orientation_' +
+                    (isPortrait ? 'portrait' : 'landscape'), null,
+                    isPortrait ? 'portrait' : 'landscape'),
+    ]).then(([{ width, height, }, unit, name, orientation]) => {
+      return this.l10n.get('document_properties_page_size_dimension_' +
+                           (name ? 'name_' : '') + 'string', {
+          width: width.toLocaleString(),
+          height: height.toLocaleString(),
+          unit,
+          name,
+          orientation,
+        }, '{{width}} × {{height}} {{unit}} (' +
+           (name ? '{{name}}, ' : '') + '{{orientation}})');
+    });
   }
 
   /**
@@ -217,15 +379,15 @@ class PDFDocumentProperties {
     // Get all elements from the PDF date string.
     // JavaScript's `Date` object expects the month to be between
     // 0 and 11 instead of 1 and 12, so we're correcting for this.
-    var year = parseInt(dateToParse.substring(0, 4), 10);
-    var month = parseInt(dateToParse.substring(4, 6), 10) - 1;
-    var day = parseInt(dateToParse.substring(6, 8), 10);
-    var hours = parseInt(dateToParse.substring(8, 10), 10);
-    var minutes = parseInt(dateToParse.substring(10, 12), 10);
-    var seconds = parseInt(dateToParse.substring(12, 14), 10);
-    var utRel = dateToParse.substring(14, 15);
-    var offsetHours = parseInt(dateToParse.substring(15, 17), 10);
-    var offsetMinutes = parseInt(dateToParse.substring(18, 20), 10);
+    let year = parseInt(dateToParse.substring(0, 4), 10);
+    let month = parseInt(dateToParse.substring(4, 6), 10) - 1;
+    let day = parseInt(dateToParse.substring(6, 8), 10);
+    let hours = parseInt(dateToParse.substring(8, 10), 10);
+    let minutes = parseInt(dateToParse.substring(10, 12), 10);
+    let seconds = parseInt(dateToParse.substring(12, 14), 10);
+    let utRel = dateToParse.substring(14, 15);
+    let offsetHours = parseInt(dateToParse.substring(15, 17), 10);
+    let offsetMinutes = parseInt(dateToParse.substring(18, 20), 10);
 
     // As per spec, utRel = 'Z' means equal to universal time.
     // The other cases ('-' and '+') have to be handled here.
@@ -238,12 +400,12 @@ class PDFDocumentProperties {
     }
 
     // Return the new date format from the user's locale.
-    var date = new Date(Date.UTC(year, month, day, hours, minutes, seconds));
-    var dateString = date.toLocaleDateString();
-    var timeString = date.toLocaleTimeString();
-    return mozL10n.get('document_properties_date_string',
-                       { date: dateString, time: timeString },
-                       '{{date}}, {{time}}');
+    let date = new Date(Date.UTC(year, month, day, hours, minutes, seconds));
+    let dateString = date.toLocaleDateString();
+    let timeString = date.toLocaleTimeString();
+    return this.l10n.get('document_properties_date_string',
+                         { date: dateString, time: timeString, },
+                         '{{date}}, {{time}}');
   }
 }
 

@@ -13,9 +13,7 @@
  * limitations under the License.
  */
 
-import {
-  addLinkAttributes, PDFJS, removeNullCharacters
-} from './pdfjs';
+import { addLinkAttributes, LinkTarget, removeNullCharacters } from 'pdfjs-lib';
 
 const DEFAULT_TITLE = '\u2013';
 
@@ -35,13 +33,12 @@ class PDFOutlineViewer {
   /**
    * @param {PDFOutlineViewerOptions} options
    */
-  constructor(options) {
-    this.outline = null;
-    this.lastToggleIsShow = true;
+  constructor({ container, linkService, eventBus, }) {
+    this.container = container;
+    this.linkService = linkService;
+    this.eventBus = eventBus;
 
-    this.container = options.container;
-    this.linkService = options.linkService;
-    this.eventBus = options.eventBus;
+    this.reset();
   }
 
   reset() {
@@ -69,20 +66,22 @@ class PDFOutlineViewer {
   /**
    * @private
    */
-  _bindLink(element, item) {
-    if (item.url) {
+  _bindLink(element, { url, newWindow, dest, }) {
+    let { linkService, } = this;
+
+    if (url) {
       addLinkAttributes(element, {
-        url: item.url,
-        target: (item.newWindow ? PDFJS.LinkTarget.BLANK : undefined),
+        url,
+        target: (newWindow ? LinkTarget.BLANK : linkService.externalLinkTarget),
+        rel: linkService.externalLinkRel,
       });
       return;
     }
-    var destination = item.dest;
 
-    element.href = this.linkService.getDestinationHash(destination);
+    element.href = linkService.getDestinationHash(dest);
     element.onclick = () => {
-      if (destination) {
-        this.linkService.navigateTo(destination);
+      if (dest) {
+        linkService.navigateTo(dest);
       }
       return false;
     };
@@ -91,12 +90,12 @@ class PDFOutlineViewer {
   /**
    * @private
    */
-  _setStyles(element, item) {
-    var styleStr = '';
-    if (item.bold) {
+  _setStyles(element, { bold, italic, }) {
+    let styleStr = '';
+    if (bold) {
       styleStr += 'font-weight: bold;';
     }
-    if (item.italic) {
+    if (italic) {
       styleStr += 'font-style: italic;';
     }
 
@@ -112,14 +111,14 @@ class PDFOutlineViewer {
    * @private
    */
   _addToggleButton(div) {
-    var toggler = document.createElement('div');
+    let toggler = document.createElement('div');
     toggler.className = 'outlineItemToggler';
     toggler.onclick = (evt) => {
       evt.stopPropagation();
       toggler.classList.toggle('outlineItemsHidden');
 
       if (evt.shiftKey) {
-        var shouldShowAll = !toggler.classList.contains('outlineItemsHidden');
+        let shouldShowAll = !toggler.classList.contains('outlineItemsHidden');
         this._toggleOutlineItem(div, shouldShowAll);
       }
     };
@@ -137,8 +136,8 @@ class PDFOutlineViewer {
    */
   _toggleOutlineItem(root, show) {
     this.lastToggleIsShow = show;
-    var togglers = root.querySelectorAll('.outlineItemToggler');
-    for (var i = 0, ii = togglers.length; i < ii; ++i) {
+    let togglers = root.querySelectorAll('.outlineItemToggler');
+    for (let i = 0, ii = togglers.length; i < ii; ++i) {
       togglers[i].classList[show ? 'remove' : 'add']('outlineItemsHidden');
     }
   }
@@ -156,32 +155,31 @@ class PDFOutlineViewer {
   /**
    * @param {PDFOutlineViewerRenderParameters} params
    */
-  render(params = {}) {
-    var outline = params.outline || null;
-    var outlineCount = 0;
+  render({ outline, }) {
+    let outlineCount = 0;
 
     if (this.outline) {
       this.reset();
     }
-    this.outline = outline;
+    this.outline = outline || null;
 
     if (!outline) {
       this._dispatchEvent(outlineCount);
       return;
     }
 
-    var fragment = document.createDocumentFragment();
-    var queue = [{ parent: fragment, items: this.outline }];
-    var hasAnyNesting = false;
+    let fragment = document.createDocumentFragment();
+    let queue = [{ parent: fragment, items: this.outline, }];
+    let hasAnyNesting = false;
     while (queue.length > 0) {
-      var levelData = queue.shift();
-      for (var i = 0, len = levelData.items.length; i < len; i++) {
-        var item = levelData.items[i];
+      let levelData = queue.shift();
+      for (let i = 0, len = levelData.items.length; i < len; i++) {
+        let item = levelData.items[i];
 
-        var div = document.createElement('div');
+        let div = document.createElement('div');
         div.className = 'outlineItem';
 
-        var element = document.createElement('a');
+        let element = document.createElement('a');
         this._bindLink(element, item);
         this._setStyles(element, item);
         element.textContent =
@@ -193,10 +191,10 @@ class PDFOutlineViewer {
           hasAnyNesting = true;
           this._addToggleButton(div);
 
-          var itemsDiv = document.createElement('div');
+          let itemsDiv = document.createElement('div');
           itemsDiv.className = 'outlineItems';
           div.appendChild(itemsDiv);
-          queue.push({ parent: itemsDiv, items: item.items });
+          queue.push({ parent: itemsDiv, items: item.items, });
         }
 
         levelData.parent.appendChild(div);
